@@ -4,6 +4,9 @@ import com.metaway.birt.designhandler.ReportDesignHandler;
 import com.metaway.birt.dtos.RelatorioDTO;
 import com.metaway.birt.entities.Relatorio;
 import com.metaway.birt.repositories.RelatorioRepository;
+import com.metaway.birt.utils.CryptoUtils;
+import com.metaway.birt.utils.JwtUtils;
+import io.jsonwebtoken.Claims;
 import org.eclipse.birt.core.framework.Platform;
 import org.eclipse.birt.report.engine.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,14 +14,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.crypto.SecretKey;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.logging.Level;
 
 /**
@@ -35,6 +42,11 @@ public class RelatorioService {
 
     @Value("${FILE-NAME}")
     private String fileName;
+    @Value("${SECRET-KEY}")
+    private String secretKey;
+
+    @Autowired
+    private JwtUtils jwtUtils;
 
     /**
      * Este é o método principal que configura o mecanismo BIRT e manipula o design do relatório
@@ -74,11 +86,20 @@ public class RelatorioService {
         try {
             task.run();
 
+            // Preenche atributo pdf
             byte[] pdfContent = Files.readAllBytes(pdfFile.toPath());
-            registerPdfAttributeAsByteArray(pdfContent, relatorio);
-            calculateChecksum(pdfContent, relatorio);
+            relatorio.setPdf(pdfContent);
 
-        } catch (EngineException | IOException | NoSuchAlgorithmException e) {
+            // Preenche atributo checksum
+            String checksum = calculateChecksum(fileName);
+            relatorio.setChecksum(checksum);
+
+            // Criptografar e concatenar os dados com o checksum
+            //encryptRelatorioData(relatorio);
+            encryptRelatorioDataJwt(relatorio);
+            repository.save(relatorio);
+
+        } catch (Exception e) {
             e.printStackTrace();
         } finally {
             task.close();
@@ -99,25 +120,110 @@ public class RelatorioService {
     }
 
     /**
-     * Armazena o PDF gerado como um array de bytes no objeto Relatorio
+     * Calcula o checksum de um arquivo
      */
-    public void registerPdfAttributeAsByteArray(byte[] pdfContent, Relatorio relatorio) throws IOException {
-        relatorio.setPdf(pdfContent);
-        repository.save(relatorio);
-    }
-
-    /**
-     * Calcula e armazena o checksum do PDF gerado no objeto Relatorio
-     */
-    private void calculateChecksum(byte[] fileBytes, Relatorio relatorio) throws NoSuchAlgorithmException {
+    private String calculateChecksum(String filePath) throws IOException, NoSuchAlgorithmException {
+        byte[] fileBytes = Files.readAllBytes(Paths.get(filePath));
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] hashBytes = digest.digest(fileBytes);
+
         StringBuilder sb = new StringBuilder();
         for (byte b : hashBytes) {
             sb.append(String.format("%02x", b));
         }
-        relatorio.setChecksum(sb.toString());
+        return sb.toString();
+    }
+
+    /**
+     * Criptografa os dados do relatório e substitui o hash
+     * Método do CryptoUtils, que necessita de chave para decriptografar
+     */
+    private void encryptRelatorioData(Relatorio relatorio) throws Exception {
+        SecretKey key = CryptoUtils.stringToKey(secretKey);
+        String encryptedData = relatorio.getEncryptedData(key);
+        String finalHash = encryptedData + "|" + relatorio.getChecksum();
+
+        relatorio.setHash(finalHash);
         repository.save(relatorio);
+    }
+
+    /**
+     * Criptografa os dados do relatório e substitui o hash
+     * Método do JwtUtils, que não necessita de chave para decriptografar
+     */
+    private void encryptRelatorioDataJwt(Relatorio relatorio) {
+        Map<String, Object> claims = relatorio.toClaims();
+        String jwt = jwtUtils.createJwt(claims, 3600000); // 1 hora de validade
+        String finalHash = jwt + "|" + relatorio.getChecksum();
+        relatorio.setHash(finalHash);
+    }
+
+    /**
+     * Compara o checksum do arquivo gerado com o checksum armazenado no banco de dados
+     */
+    public boolean compareChecksum(RelatorioDTO relatorio) throws IOException, NoSuchAlgorithmException {
+        String currentChecksum = calculateChecksum(fileName);
+        return currentChecksum.equals(relatorio.getChecksum());
+    }
+
+    /**
+     * Decriptografa e verifica a hash de um um relatório pelo seu id
+     * Decriptografa através do CryptoUtils, que necessita de chave
+     * Utilizar ou esse ou o Jwt
+     */
+    public String decryptAndVerifyData(Long id) throws Exception {
+        Relatorio relatorio = repository.findById(id).orElse(null);
+
+        // Obter a chave secreta
+        SecretKey key = CryptoUtils.stringToKey(secretKey);
+
+        // Separar o hash e o checksum
+        String[] parts = relatorio.getHash().split("\\|");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("Formato de hash inválido");
+        }
+        String encryptedData = parts[0];
+
+        // Decriptografar os dados
+        String decryptedData = CryptoUtils.decrypt(encryptedData, key);
+
+        // Validar os dados descriptografados
+        String expectedData = "ID:" + relatorio.getCdrel() + "|Date:" + relatorio.getCriadoEm() + "|User:" + relatorio.getCriadoPor() + "|Checksum:" + relatorio.getChecksum();
+        if (!decryptedData.equals(expectedData)) {
+            throw new IllegalArgumentException("Os dados descriptografados não correspondem aos dados esperados");
+        }
+
+        // Retornar os dados descriptografados para verificação
+        return decryptedData;
+    }
+
+    /**
+     * Decriptografa e verifica a hash de um um relatório pelo seu id
+     * Decriptografa através do JwtUtils, que não necessita de chave
+     */
+    public String decryptAndVerifyDataJwt(Long relatorioId) {
+        Relatorio relatorio = repository.findById(relatorioId).orElse(null);
+
+        String[] parts = relatorio.getHash().split("\\|");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("Formato de hash inválido");
+        }
+        String jwt = parts[0];
+        Claims claims = jwtUtils.parseJwt(jwt);
+
+        Long id = ((Number) claims.get("id")).longValue();
+        String date = (String) claims.get("date");
+        String user = (String) claims.get("user");
+        String checksum = (String) claims.get("checksum");
+
+        String expectedData = "ID:" + id + ",Date:" + date + ",User:" + user + ",Checksum:" + checksum;
+        String actualData = "ID:" + relatorio.getCdrel() + ",Date:" + relatorio.getCriadoEm() + ",User:" + relatorio.getCriadoPor() + ",Checksum:" + relatorio.getChecksum();
+
+        if (!expectedData.equals(actualData)) {
+            throw new IllegalArgumentException("Os dados descriptografados não correspondem aos dados esperados");
+        }
+
+        return actualData;
     }
 
     /**
@@ -134,6 +240,14 @@ public class RelatorioService {
     @Transactional(readOnly = true)
     public RelatorioDTO findByHash(String hash) {
         return new RelatorioDTO(repository.findByHash(hash));
+    }
+
+    /**
+     * Busca um relatório pelo seu id
+     */
+    @Transactional(readOnly = true)
+    public RelatorioDTO findById(Long id) {
+        return new RelatorioDTO(Objects.requireNonNull(repository.findById(id).orElse(null)));
     }
 
     /**

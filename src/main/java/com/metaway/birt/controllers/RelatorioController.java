@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.io.File;
 import java.io.IOException;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 
 @RestController
@@ -45,6 +46,30 @@ public class RelatorioController {
         }
     }
 
+    @GetMapping("/verifyChecksum/{relatorioId}")
+    public ResponseEntity<String> verifyChecksum(@PathVariable Long relatorioId) {
+        RelatorioDTO relatorio = service.findById(relatorioId);
+        if (relatorio == null) {
+            return ResponseEntity.status(404).body("Relatório não encontrado");
+        }
+
+        try {
+            boolean isValid = service.compareChecksum(relatorio);
+            if (isValid) {
+                return ResponseEntity.ok("Checksum válido, o arquivo não foi alterado.");
+            } else {
+                return ResponseEntity.status(400).body("Checksum inválido, o arquivo pode ter sido alterado.");
+            }
+        } catch (IOException | NoSuchAlgorithmException e) {
+            return ResponseEntity.status(500).body("Erro ao verificar o checksum");
+        }
+    }
+
+    @GetMapping(value = "/decrypt/{id}")
+    public ResponseEntity<?> decryptData(@PathVariable("id") Long id) throws Exception {
+        return ResponseEntity.ok(service.decryptAndVerifyDataJwt(id));
+    }
+
     @GetMapping
     public ResponseEntity<List<RelatorioDTO>> findAll() {
         return ResponseEntity.ok(service.findAll());
@@ -53,6 +78,11 @@ public class RelatorioController {
     @GetMapping(value = "/{hash}")
     public ResponseEntity<RelatorioDTO> findByHash(@PathVariable("hash") String hash) {
         return ResponseEntity.ok(service.findByHash(hash));
+    }
+
+    @GetMapping(value = "/id/{id}")
+    public ResponseEntity<RelatorioDTO> findById(@PathVariable("id") Long id) {
+        return ResponseEntity.ok(service.findById(id));
     }
 
     @GetMapping(value = "/abrir/{id}")
